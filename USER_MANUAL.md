@@ -36,13 +36,31 @@
 - **Series ID**: Identifier for multiple time series (if missing, app creates default "Series_1")
 - **Exogenous Variables**: Additional numeric predictors (e.g., temperature, price, marketing spend)
 
-### Data Format Example
+### Data Format Examples
+
+#### **Standard Monthly Data**
 ```csv
 Period,Value,Region,Temperature,Marketing
 2023-01,1250,North,15.2,5000
 2023-02,1340,North,18.1,5200
 2023-03,1420,North,22.3,4800
 ```
+
+#### **Mixed Frequency Data** (New Feature!)
+```csv
+Period,Value,Region,Temperature
+2023-01-01,100,North,15.2
+2023-01-15,110,North,16.1
+2023-02-01,120,North,18.5
+2023-02-15,115,North,19.2
+```
+
+#### **Various Date Formats Supported**
+- `2023-01` (YYYY-MM)
+- `2023-01-15` (YYYY-MM-DD)
+- `1/15/2023` (M/D/YYYY)
+- `01/15/23` (MM/DD/YY)
+- `15/01/2023` (DD/MM/YYYY)
 
 ### Future Exogenous Data
 If using exogenous variables, upload a second CSV with future values for out-of-sample forecasting:
@@ -67,6 +85,15 @@ Period,Region,Temperature,Marketing
 - **Future Exogenous CSV**: Future values for predictor variables (required for out-of-sample forecasting with exogenous variables)
 
 ### 2. Preprocessing Section
+
+#### **Frequency Normalization**
+- **Enable frequency normalization**: Automatically detect and normalize data frequencies across all variables
+- **Frequency conversion strategy**:
+  - **Auto-detect recommended frequency**: Uses the most common frequency in your data
+  - **Manually select target frequency**: Choose specific frequency (Daily, Weekly, Monthly, Quarterly, Yearly)
+  - **Convert to highest frequency**: Uses the highest frequency found in data
+  - **Convert to lowest frequency**: Uses the lowest frequency found in data
+- **Advanced: Customize conversion methods**: Configure upsampling/downsampling methods per variable
 
 #### **Missing Value Handling**
 - **ffill_then_interpolate** (Recommended): Forward fill missing values, then use linear interpolation
@@ -94,6 +121,93 @@ Period,Region,Temperature,Marketing
 #### **Forecast Settings**
 - **Seasonal Period (s)**: Number of periods in seasonal cycle (12 for monthly data)
 - **Forecast Horizon**: Number of periods to forecast into the future
+
+---
+
+## Frequency Normalization (New Feature!)
+
+### Overview
+The frequency normalization feature automatically detects different data frequencies and converts all variables to a common frequency. This is especially useful when:
+
+- Your time series data has irregular intervals
+- Different variables have different frequencies (e.g., daily sales, monthly marketing spend)
+- You want to work with higher or lower frequency data than originally collected
+
+### How It Works
+
+#### **1. Automatic Detection**
+The app analyzes your Period column and detects:
+- **Daily** data (1-day intervals)
+- **Weekly** data (7-day intervals) 
+- **Monthly** data (28-32 day intervals)
+- **Quarterly** data (89-93 day intervals)
+- **Yearly** data (360-370 day intervals)
+
+#### **2. Frequency Conversion Strategies**
+
+**Auto-detect (Recommended)**
+- Uses the most common frequency in your dataset
+- Best for datasets where most variables share the same frequency
+
+**Manual Selection**
+- You choose the target frequency
+- Useful when you have specific business requirements
+
+**Highest Frequency**
+- Converts all data to the most granular frequency found
+- Maximizes data points but may introduce interpolation artifacts
+
+**Lowest Frequency**
+- Converts all data to the least granular frequency found
+- Minimizes interpolation but may lose detailed patterns
+
+#### **3. Conversion Methods**
+
+**Upsampling (Low → High Frequency)**
+- **Linear Interpolation**: Smooth transitions between points (best for continuous variables)
+- **Cubic Interpolation**: More complex curves (good for smooth trends)
+- **Forward Fill**: Repeat last known value (good for step-functions)
+- **Repeat**: Same as forward fill
+
+**Downsampling (High → Low Frequency)**
+- **Mean**: Average values within each period (best for rates, temperatures)
+- **Sum**: Add up values within each period (best for sales, counts)
+- **Last/First**: Take the last/first value in each period
+- **Min/Max**: Take extreme values within each period
+
+#### **4. Smart Recommendations**
+The app automatically recommends conversion methods based on variable names:
+
+| Variable Type | Examples | Upsampling | Downsampling |
+|--------------|----------|------------|--------------|
+| **Continuous** | price, temperature, score | Linear | Mean |
+| **Cumulative** | sales, revenue, volume | Repeat | Sum |
+| **Categorical** | status, flag, indicator | Forward Fill | Last |
+
+### Validation and Warnings
+
+The app monitors conversion quality and warns you about:
+- **Significant statistical changes** (>5% change in mean)
+- **Data point changes** (increase/decrease in observations)
+- **Potential information loss**
+
+### Best Practices
+
+#### **When to Enable**
+- Mixed frequency datasets
+- Irregular time intervals
+- Want to standardize data frequency across variables
+
+#### **When to Disable**
+- All data already has consistent frequency
+- Working with small datasets (<30 observations)
+- Concerned about introducing interpolation artifacts
+
+#### **Choosing Conversion Methods**
+- **Sales/Revenue**: Use Sum for downsampling, Repeat for upsampling
+- **Prices/Rates**: Use Mean for downsampling, Linear for upsampling
+- **Binary Indicators**: Use Last for downsampling, Forward Fill for upsampling
+- **When in doubt**: Use the app's automatic recommendations
 
 ---
 

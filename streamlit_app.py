@@ -1,7 +1,8 @@
 import io
 import itertools
+import re
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -46,12 +47,18 @@ def parse_month(series: pd.Series) -> pd.DatetimeIndex:
     return parsed
 
 
-def coerce_monthly_index(df: pd.DataFrame, date_col: str) -> pd.DataFrame:
+def coerce_flexible_dates(df: pd.DataFrame, date_col: str) -> pd.DataFrame:
+    """Parse flexible date formats and return dataframe with datetime column."""
     df = df.copy()
-    df[date_col] = parse_month(df[date_col])
+    df[date_col] = parse_flexible_dates(df[date_col])
     if df[date_col].isna().any():
-        raise ValueError("Some Period values could not be parsed. Ensure YYYY-MM format.")
+        raise ValueError("Some date values could not be parsed. Please check date format.")
     return df
+
+
+def coerce_monthly_index(df: pd.DataFrame, date_col: str) -> pd.DataFrame:
+    """Legacy function - now uses flexible date parsing."""
+    return coerce_flexible_dates(df, date_col)
 
 
 def ensure_complete_monthly_range(df: pd.DataFrame, date_col: str, series_col: str) -> pd.DataFrame:
@@ -85,6 +92,318 @@ def infer_series_and_exog_columns(df: pd.DataFrame) -> Tuple[Optional[str], List
         return None, []
     # Heuristic: first non Period/Value is series id; others are exog candidates
     return candidates[0], candidates[1:]
+
+
+# ----------------------------
+# Frequency Detection and Conversion
+# ----------------------------
+
+def parse_flexible_dates(series: pd.Series) -> pd.DatetimeIndex:
+    """Parse various date formats to datetime index."""
+    # Try common date formats
+    date_formats = [
+        "%Y-%m",           # 2023-01
+        "%Y-%m-%d",        # 2023-01-15
+        "%m/%d/%Y",        # 3/15/2023
+        "%m/%d/%y",        # 3/15/23
+        "%d/%m/%Y",        # 15/3/2023 (European)
+        "%d/%m/%y",        # 15/3/23
+        "%Y/%m/%d",        # 2023/3/15
+        "%Y-%m-%d %H:%M:%S",  # 2023-01-15 12:30:00
+        "%Y-%m-%d %H:%M",     # 2023-01-15 12:30
+    ]
+    
+    # First try pandas' flexible parsing
+    try:
+        parsed = pd.to_datetime(series, infer_datetime_format=True, errors='coerce')
+        if not parsed.isna().any():
+            return parsed
+    except:
+        pass
+    
+    # Try specific formats
+    for fmt in date_formats:
+        try:
+            parsed = pd.to_datetime(series.astype(str), format=fmt, errors='coerce')
+            if not parsed.isna().any():
+                return parsed
+        except:
+            continue
+    
+    # Last resort: try to parse each format individually and take the one with fewest NaNs
+    best_parsed = None
+    min_nas = len(series)
+    
+    for fmt in date_formats:
+        try:
+            parsed = pd.to_datetime(series.astype(str), format=fmt, errors='coerce')
+            na_count = parsed.isna().sum()
+            if na_count < min_nas:
+                min_nas = na_count
+                best_parsed = parsed
+        except:
+            continue
+    
+    if best_parsed is not None and min_nas < len(series) * 0.5:  # Accept if <50% NaNs
+        return best_parsed
+    
+    # Final fallback
+    return pd.to_datetime(series, errors='coerce')
+
+
+def detect_frequency(dates: pd.DatetimeIndex) -> Tuple[str, str]:
+    """Detect the frequency of a datetime index.
+    
+    Returns:
+        Tuple of (frequency_code, frequency_name)
+    """
+    if len(dates) < 2:
+        return 'D', 'Daily'
+    
+    # Sort dates to ensure proper diff calculation
+    dates_sorted = dates.sort_values()
+    diffs = dates_sorted.diff().dropna()
+    
+    # Get the most common difference
+    mode_diff = diffs.mode()
+    if len(mode_diff) == 0:
+        return 'D', 'Daily'
+    
+    most_common_diff = mode_diff[0]
+    days = most_common_diff.days
+    
+    # Classify frequency based on most common difference
+    if days == 1:
+        return 'D', 'Daily'
+    elif 6 <= days <= 8:  # Account for weekends
+        return 'W', 'Weekly'
+    elif 28 <= days <= 32:  # Account for varying month lengths
+        return 'M', 'Monthly'
+    elif 89 <= days <= 93:  # Quarterly (roughly 91 days)
+        return 'Q', 'Quarterly'
+    elif 360 <= days <= 370:  # Yearly
+        return 'Y', 'Yearly'
+    else:
+        # For irregular frequencies, default to daily
+        return 'D', 'Daily'
+
+
+def get_frequency_hierarchy() -> Dict[str, int]:
+    """Get frequency hierarchy for comparison (higher number = higher frequency)."""
+    return {
+        'Y': 1,   # Yearly
+        'Q': 4,   # Quarterly  
+        'M': 12,  # Monthly
+        'W': 52,  # Weekly
+        'D': 365  # Daily
+    }
+
+
+def recommend_base_frequency(frequencies: Dict[str, str]) -> str:
+    """Recommend base frequency from detected frequencies."""
+    hierarchy = get_frequency_hierarchy()
+    
+    # Get the most common frequency
+    freq_counts = {}
+    for freq_code in frequencies.values():
+        freq_counts[freq_code] = freq_counts.get(freq_code, 0) + 1
+    
+    if not freq_counts:
+        return 'M'  # Default to monthly
+    
+    # Return the most common frequency
+    return max(freq_counts.items(), key=lambda x: x[1])[0]
+
+
+def get_conversion_methods() -> Dict[str, Dict[str, List[str]]]:
+    """Get available conversion methods for upsampling and downsampling."""
+    return {
+        'upsample': {
+            'interpolation': ['linear', 'cubic', 'nearest'],
+            'fill': ['forward_fill', 'backward_fill', 'repeat']
+        },
+        'downsample': {
+            'aggregation': ['mean', 'sum', 'median', 'last', 'first', 'min', 'max']
+        }
+    }
+
+
+def get_recommended_conversion_method(variable_name: str, is_target: bool = False) -> Dict[str, str]:
+    """Recommend conversion methods based on variable characteristics."""
+    variable_lower = variable_name.lower()
+    
+    # Default recommendations
+    defaults = {
+        'upsample_method': 'linear',
+        'downsample_method': 'mean'
+    }
+    
+    # Target variable usually benefits from interpolation
+    if is_target:
+        defaults['upsample_method'] = 'linear'
+        defaults['downsample_method'] = 'mean'
+        return defaults
+    
+    # Specific recommendations based on variable name patterns
+    if any(word in variable_lower for word in ['price', 'rate', 'temperature', 'score', 'index']):
+        defaults['upsample_method'] = 'linear'
+        defaults['downsample_method'] = 'mean'
+    elif any(word in variable_lower for word in ['sales', 'revenue', 'volume', 'count', 'quantity']):
+        defaults['upsample_method'] = 'repeat'
+        defaults['downsample_method'] = 'sum'
+    elif any(word in variable_lower for word in ['binary', 'flag', 'indicator', 'status']):
+        defaults['upsample_method'] = 'forward_fill'
+        defaults['downsample_method'] = 'last'
+    
+    return defaults
+
+
+def convert_frequency(df: pd.DataFrame, date_col: str, target_freq: str, 
+                     conversion_methods: Dict[str, Dict[str, str]] = None) -> pd.DataFrame:
+    """Convert dataframe to target frequency."""
+    if df.empty:
+        return df
+    
+    df = df.copy()
+    df = df.sort_values(date_col)
+    
+    # Set date column as index
+    df_indexed = df.set_index(date_col)
+    
+    # Determine if we need upsampling or downsampling
+    current_freq, _ = detect_frequency(df_indexed.index)
+    hierarchy = get_frequency_hierarchy()
+    
+    target_hierarchy = hierarchy.get(target_freq, 12)
+    current_hierarchy = hierarchy.get(current_freq, 12)
+    
+    # Create target frequency string for pandas
+    freq_map = {
+        'D': 'D',
+        'W': 'W',
+        'M': 'MS',  # Month start
+        'Q': 'QS',  # Quarter start
+        'Y': 'YS'   # Year start
+    }
+    
+    pandas_freq = freq_map.get(target_freq, 'MS')
+    
+    if target_hierarchy > current_hierarchy:
+        # Upsampling (lower to higher frequency)
+        return _upsample_dataframe(df_indexed, pandas_freq, conversion_methods)
+    elif target_hierarchy < current_hierarchy:
+        # Downsampling (higher to lower frequency)
+        return _downsample_dataframe(df_indexed, pandas_freq, conversion_methods)
+    else:
+        # Same frequency, just ensure regular intervals
+        return _regularize_frequency(df_indexed, pandas_freq)
+
+
+def _upsample_dataframe(df: pd.DataFrame, target_freq: str, 
+                       conversion_methods: Dict[str, Dict[str, str]] = None) -> pd.DataFrame:
+    """Upsample dataframe to higher frequency."""
+    # Create full date range
+    full_range = pd.date_range(start=df.index.min(), end=df.index.max(), freq=target_freq)
+    df_reindexed = df.reindex(full_range)
+    
+    # Apply conversion methods per column
+    for col in df_reindexed.columns:
+        method_info = conversion_methods.get(col, {}) if conversion_methods else {}
+        method = method_info.get('upsample_method', 'linear')
+        
+        if method == 'linear':
+            df_reindexed[col] = df_reindexed[col].interpolate(method='linear')
+        elif method == 'cubic':
+            df_reindexed[col] = df_reindexed[col].interpolate(method='cubic')
+        elif method == 'nearest':
+            df_reindexed[col] = df_reindexed[col].interpolate(method='nearest')
+        elif method == 'forward_fill':
+            df_reindexed[col] = df_reindexed[col].fillna(method='ffill')
+        elif method == 'backward_fill':
+            df_reindexed[col] = df_reindexed[col].fillna(method='bfill')
+        elif method == 'repeat':
+            df_reindexed[col] = df_reindexed[col].fillna(method='ffill')
+    
+    return df_reindexed.reset_index().rename(columns={'index': df.index.name or 'Period'})
+
+
+def _downsample_dataframe(df: pd.DataFrame, target_freq: str,
+                         conversion_methods: Dict[str, Dict[str, str]] = None) -> pd.DataFrame:
+    """Downsample dataframe to lower frequency."""
+    # Group by target frequency and apply aggregation methods
+    grouped = df.groupby(pd.Grouper(freq=target_freq))
+    
+    result_dfs = []
+    for col in df.columns:
+        method_info = conversion_methods.get(col, {}) if conversion_methods else {}
+        method = method_info.get('downsample_method', 'mean')
+        
+        if method == 'mean':
+            col_result = grouped[col].mean()
+        elif method == 'sum':
+            col_result = grouped[col].sum()
+        elif method == 'median':
+            col_result = grouped[col].median()
+        elif method == 'last':
+            col_result = grouped[col].last()
+        elif method == 'first':
+            col_result = grouped[col].first()
+        elif method == 'min':
+            col_result = grouped[col].min()
+        elif method == 'max':
+            col_result = grouped[col].max()
+        else:
+            col_result = grouped[col].mean()  # Default fallback
+        
+        result_dfs.append(col_result)
+    
+    # Combine results
+    result = pd.concat(result_dfs, axis=1)
+    result = result.dropna(how='all')  # Remove periods with no data
+    
+    return result.reset_index().rename(columns={'index': df.index.name or 'Period'})
+
+
+def _regularize_frequency(df: pd.DataFrame, target_freq: str) -> pd.DataFrame:
+    """Regularize frequency without changing it."""
+    full_range = pd.date_range(start=df.index.min(), end=df.index.max(), freq=target_freq)
+    df_reindexed = df.reindex(full_range)
+    
+    # Forward fill missing values
+    df_reindexed = df_reindexed.fillna(method='ffill')
+    
+    return df_reindexed.reset_index().rename(columns={'index': df.index.name or 'Period'})
+
+
+def analyze_frequency_conversion_impact(df_before: pd.DataFrame, df_after: pd.DataFrame, 
+                                      value_cols: List[str]) -> Dict[str, Dict[str, Union[str, float]]]:
+    """Analyze the impact of frequency conversion."""
+    impact = {}
+    
+    for col in value_cols:
+        if col in df_before.columns and col in df_after.columns:
+            before_vals = df_before[col].dropna()
+            after_vals = df_after[col].dropna()
+            
+            impact[col] = {
+                'data_points_before': len(before_vals),
+                'data_points_after': len(after_vals),
+                'data_point_change': len(after_vals) - len(before_vals),
+                'mean_before': before_vals.mean() if len(before_vals) > 0 else np.nan,
+                'mean_after': after_vals.mean() if len(after_vals) > 0 else np.nan,
+                'std_before': before_vals.std() if len(before_vals) > 0 else np.nan,
+                'std_after': after_vals.std() if len(after_vals) > 0 else np.nan,
+            }
+            
+            # Calculate percentage change in statistics
+            if not np.isnan(impact[col]['mean_before']) and impact[col]['mean_before'] != 0:
+                mean_pct_change = ((impact[col]['mean_after'] - impact[col]['mean_before']) / 
+                                 abs(impact[col]['mean_before'])) * 100
+                impact[col]['mean_change_pct'] = mean_pct_change
+            else:
+                impact[col]['mean_change_pct'] = 0
+    
+    return impact
 
 
 def train_test_split_last_n(
@@ -371,11 +690,56 @@ with st.sidebar:
     )
 
     st.header("2) Preprocessing")
+    
+    # Frequency Normalization Section
+    st.subheader("Frequency Normalization")
+    enable_freq_norm = st.checkbox(
+        "Enable frequency normalization", 
+        value=False,
+        help="Automatically detect and normalize data frequencies across all variables"
+    )
+    
+    if enable_freq_norm:
+        freq_strategy = st.radio(
+            "Frequency conversion strategy",
+            ["auto_detect", "manual_select", "highest_frequency", "lowest_frequency"],
+            format_func=lambda x: {
+                "auto_detect": "Auto-detect recommended frequency",
+                "manual_select": "Manually select target frequency", 
+                "highest_frequency": "Convert to highest frequency",
+                "lowest_frequency": "Convert to lowest frequency"
+            }[x],
+            index=0,
+            help="Strategy for determining the target frequency"
+        )
+        
+        if freq_strategy == "manual_select":
+            manual_frequency = st.selectbox(
+                "Target frequency",
+                ["D", "W", "M", "Q", "Y"],
+                format_func=lambda x: {
+                    "D": "Daily",
+                    "W": "Weekly", 
+                    "M": "Monthly",
+                    "Q": "Quarterly",
+                    "Y": "Yearly"
+                }[x],
+                index=2  # Default to Monthly
+            )
+        
+        show_conversion_admin = st.checkbox(
+            "Advanced: Customize conversion methods per variable",
+            value=False,
+            help="Configure upsampling/downsampling methods for each variable"
+        )
+    
+    # Traditional preprocessing options
+    st.subheader("Missing Values & Scaling")
     missing_method = st.selectbox(
         "Missing value handling",
         ["ffill_then_interpolate", "interpolate_only", "ffill_only"],
         index=0,
-        help="Applied per series after ensuring monthly frequency",
+        help="Applied per series after frequency normalization",
     )
     standardize = st.checkbox("Standardize exogenous variables", value=True)
 
@@ -407,13 +771,16 @@ with st.sidebar:
     run_button = st.button("Run Modeling")
 
 
-def read_and_prepare(df_raw: pd.DataFrame) -> Tuple[pd.DataFrame, str, List[str]]:
+def read_and_prepare(df_raw: pd.DataFrame, enable_freq_norm: bool = False, 
+                    freq_strategy: str = "auto_detect", manual_frequency: str = "M",
+                    show_conversion_admin: bool = False) -> Tuple[pd.DataFrame, str, List[str], Dict]:
     df = df_raw.copy()
     required_cols = {"Period", "Value"}
     if not required_cols.issubset(set(df.columns)):
         raise ValueError("CSV must contain columns: Period, Value")
 
-    df = coerce_monthly_index(df, "Period")
+    # Parse dates with flexible format support
+    df = coerce_flexible_dates(df, "Period")
     inferred_series_col, exog_cands = infer_series_and_exog_columns(df)
 
     # Let user pick columns explicitly, handle case with no series column by creating one
@@ -448,7 +815,167 @@ def read_and_prepare(df_raw: pd.DataFrame) -> Tuple[pd.DataFrame, str, List[str]
         default=exog_default,
     )
 
-    df = ensure_complete_monthly_range(df[["Period", "Value", series_col] + exog_cols], "Period", series_col)
+    # Initialize frequency normalization info
+    freq_info = {}
+    
+    # Frequency normalization
+    if enable_freq_norm:
+        st.subheader("Frequency Analysis")
+        
+        # Detect frequencies for each series
+        detected_frequencies = {}
+        all_series = df[series_col].unique()
+        
+        for series_id in all_series:
+            series_data = df[df[series_col] == series_id].sort_values("Period")
+            freq_code, freq_name = detect_frequency(series_data["Period"])
+            detected_frequencies[series_id] = freq_code
+            
+        # Show detected frequencies
+        freq_summary = {}
+        for freq_code in set(detected_frequencies.values()):
+            freq_name = {
+                'D': 'Daily', 'W': 'Weekly', 'M': 'Monthly', 
+                'Q': 'Quarterly', 'Y': 'Yearly'
+            }.get(freq_code, freq_code)
+            series_with_freq = [s for s, f in detected_frequencies.items() if f == freq_code]
+            freq_summary[freq_name] = len(series_with_freq)
+        
+        st.write("**Detected Frequencies:**")
+        for freq_name, count in freq_summary.items():
+            st.write(f"- {freq_name}: {count} series")
+        
+        # Determine target frequency
+        if freq_strategy == "auto_detect":
+            target_freq = recommend_base_frequency(detected_frequencies)
+            recommended_name = {
+                'D': 'Daily', 'W': 'Weekly', 'M': 'Monthly',
+                'Q': 'Quarterly', 'Y': 'Yearly'
+            }.get(target_freq, target_freq)
+            st.info(f"Recommended target frequency: **{recommended_name}**")
+        elif freq_strategy == "manual_select":
+            target_freq = manual_frequency
+        elif freq_strategy == "highest_frequency":
+            hierarchy = get_frequency_hierarchy()
+            target_freq = max(detected_frequencies.values(), key=lambda x: hierarchy.get(x, 0))
+        else:  # lowest_frequency
+            hierarchy = get_frequency_hierarchy()
+            target_freq = min(detected_frequencies.values(), key=lambda x: hierarchy.get(x, 999))
+        
+        # Show conversion methods admin panel
+        conversion_methods = {}
+        if show_conversion_admin:
+            st.subheader("Conversion Methods Configuration")
+            
+            all_variables = ["Value"] + exog_cols
+            for var in all_variables:
+                st.write(f"**{var}**")
+                is_target = (var == "Value")
+                recommended = get_recommended_conversion_method(var, is_target)
+                
+                col1, col2 = st.columns(2)
+                with col1:
+                    upsample_method = st.selectbox(
+                        f"Upsampling method",
+                        ["linear", "cubic", "nearest", "forward_fill", "backward_fill", "repeat"],
+                        index=["linear", "cubic", "nearest", "forward_fill", "backward_fill", "repeat"].index(
+                            recommended['upsample_method']
+                        ),
+                        key=f"upsample_{var}",
+                        help="Method used when increasing frequency (e.g., monthly to daily)"
+                    )
+                
+                with col2:
+                    downsample_method = st.selectbox(
+                        f"Downsampling method",
+                        ["mean", "sum", "median", "last", "first", "min", "max"],
+                        index=["mean", "sum", "median", "last", "first", "min", "max"].index(
+                            recommended['downsample_method']
+                        ),
+                        key=f"downsample_{var}",
+                        help="Method used when decreasing frequency (e.g., daily to monthly)"
+                    )
+                
+                conversion_methods[var] = {
+                    'upsample_method': upsample_method,
+                    'downsample_method': downsample_method
+                }
+        else:
+            # Use recommended methods
+            all_variables = ["Value"] + exog_cols
+            for var in all_variables:
+                is_target = (var == "Value")
+                conversion_methods[var] = get_recommended_conversion_method(var, is_target)
+        
+        # Perform frequency conversion
+        if target_freq != list(detected_frequencies.values())[0] or len(set(detected_frequencies.values())) > 1:
+            st.info(f"Converting all data to {target_freq} frequency...")
+            
+            # Convert each series separately
+            converted_dfs = []
+            conversion_impact = {}
+            
+            for series_id in all_series:
+                series_data = df[df[series_col] == series_id][["Period", "Value", series_col] + exog_cols]
+                
+                # Analyze impact before conversion
+                before_stats = analyze_frequency_conversion_impact(
+                    series_data, series_data, ["Value"] + exog_cols
+                )
+                
+                # Convert frequency
+                converted_series = convert_frequency(
+                    series_data, "Period", target_freq, conversion_methods
+                )
+                
+                # Analyze impact after conversion
+                after_stats = analyze_frequency_conversion_impact(
+                    series_data, converted_series, ["Value"] + exog_cols
+                )
+                
+                conversion_impact[series_id] = after_stats
+                converted_dfs.append(converted_series)
+            
+            # Combine converted series
+            df = pd.concat(converted_dfs, ignore_index=True)
+            
+            # Show conversion impact summary
+            st.subheader("Frequency Conversion Impact")
+            
+            # Check for significant changes
+            warnings = []
+            for series_id, impact in conversion_impact.items():
+                for var, stats in impact.items():
+                    if abs(stats.get('mean_change_pct', 0)) > 5:  # >5% change in mean
+                        warnings.append(f"Series {series_id}, Variable {var}: {stats['mean_change_pct']:.1f}% change in mean")
+                    
+                    data_change = stats.get('data_point_change', 0)
+                    if data_change != 0:
+                        change_type = "increase" if data_change > 0 else "decrease"
+                        warnings.append(f"Series {series_id}, Variable {var}: {abs(data_change)} data points {change_type}")
+            
+            if warnings:
+                st.warning("**Information Loss/Change Detected:**")
+                for warning in warnings[:5]:  # Show first 5 warnings
+                    st.write(f"- {warning}")
+                if len(warnings) > 5:
+                    st.write(f"... and {len(warnings) - 5} more warnings")
+            else:
+                st.success("Frequency conversion completed with minimal impact on data statistics.")
+        
+        freq_info = {
+            'enabled': True,
+            'target_frequency': target_freq,
+            'detected_frequencies': detected_frequencies,
+            'conversion_methods': conversion_methods,
+            'conversion_impact': conversion_impact if 'conversion_impact' in locals() else {}
+        }
+    else:
+        # Legacy behavior - ensure complete monthly range
+        df = ensure_complete_monthly_range(df[["Period", "Value", series_col] + exog_cols], "Period", series_col)
+        freq_info = {'enabled': False}
+
+    # Clean missing values
     df = clean_missing_values(df, "Value")
 
     # Fill missing exog values similarly
@@ -456,7 +983,7 @@ def read_and_prepare(df_raw: pd.DataFrame) -> Tuple[pd.DataFrame, str, List[str]
         if df[c].isna().any():
             df[c] = df[c].ffill().bfill()
 
-    return df, series_col, exog_cols
+    return df, series_col, exog_cols, freq_info
 
 
 def align_future_exog(
@@ -475,7 +1002,7 @@ def align_future_exog(
     if not {"Period", series_col}.issubset(fdf.columns):
         st.warning("Future exogenous CSV must include Period and the series id column.")
         return None
-    fdf = coerce_monthly_index(fdf, "Period")
+    fdf = coerce_flexible_dates(fdf, "Period")
     # Keep only needed columns
     fdf = fdf[["Period", series_col] + [c for c in exog_cols if c in fdf.columns]]
     # Build required future index per series
@@ -577,7 +1104,24 @@ if uploaded is not None and run_button:
         st.stop()
 
     try:
-        df, series_col, exog_cols = read_and_prepare(raw_df)
+        # Get frequency normalization settings from sidebar
+        freq_norm_settings = {}
+        if 'enable_freq_norm' in locals():
+            freq_norm_settings = {
+                'enable_freq_norm': enable_freq_norm,
+                'freq_strategy': freq_strategy if enable_freq_norm else "auto_detect",
+                'manual_frequency': manual_frequency if enable_freq_norm and freq_strategy == "manual_select" else "M",
+                'show_conversion_admin': show_conversion_admin if enable_freq_norm else False
+            }
+        else:
+            freq_norm_settings = {
+                'enable_freq_norm': False,
+                'freq_strategy': "auto_detect", 
+                'manual_frequency': "M",
+                'show_conversion_admin': False
+            }
+        
+        df, series_col, exog_cols, freq_info = read_and_prepare(raw_df, **freq_norm_settings)
     except Exception as e:  # noqa: BLE001
         st.error(str(e))
         st.stop()
@@ -745,6 +1289,25 @@ if uploaded is not None and run_button:
         table = build_results_table(sid, "Period", "Value", series_col, sdf, fitted, pred, pred_ci, future_forecast, future_ci)
         results_frames.append(table)
         build_download(table, f"results_{sid}.csv", f"Download CSV ({sid})")
+
+    # Show frequency normalization summary if used
+    if freq_info.get('enabled', False):
+        st.subheader("Frequency Normalization Summary")
+        target_freq_name = {
+            'D': 'Daily', 'W': 'Weekly', 'M': 'Monthly',
+            'Q': 'Quarterly', 'Y': 'Yearly'
+        }.get(freq_info.get('target_frequency', 'M'), 'Unknown')
+        
+        st.info(f"All data converted to: **{target_freq_name}** frequency")
+        
+        if freq_info.get('conversion_impact'):
+            with st.expander("View Conversion Impact Details"):
+                for series_id, impact in freq_info['conversion_impact'].items():
+                    st.write(f"**{series_id}:**")
+                    for var, stats in impact.items():
+                        data_change = stats.get('data_point_change', 0)
+                        mean_change = stats.get('mean_change_pct', 0)
+                        st.write(f"  - {var}: {data_change:+d} data points, {mean_change:+.1f}% mean change")
 
     # Combined export
     if results_frames:
